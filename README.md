@@ -6,9 +6,8 @@ There are implementation of incremental learning in ways of survy approachs, inc
 4. Our Method(Train with pseudo examplar produced by CVAE), https://hdl.handle.net/11296/6dw9k2
 
 
-We set incremental learning task on 2 different dataset with  2 kinds of incremental steps independently：
-1. Cifar100: 10 classes per each step (10 steps), and 50 clasess + 5 classes per each step(11steps).
-2. ImageNet: 100 classes per each step (10 steps), and 500 clasess + 50 classes per each step(11steps).
+We set incremental learning task on Cifar100 dataset with  2 kinds of incremental steps independently：
+1.  10 classes per each step (10 steps), and 50 clasess + 5 classes per each step(11steps).
 
 In Order to compare approachs with/without old class data storage and with pseudo data, there are following settings:
 1. Offline/Baseline: training  with whole classes data so far, which is used as upper bound of incrementl learning performance.
