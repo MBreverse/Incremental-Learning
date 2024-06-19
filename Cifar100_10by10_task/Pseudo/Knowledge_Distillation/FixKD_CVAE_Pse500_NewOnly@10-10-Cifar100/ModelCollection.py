@@ -4,15 +4,20 @@ import torch.nn as nn
 import torch
 import torch.nn.parameter as parameter
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
     
-def init_weights_with_zeros(m):
-    m.weight.data.fill_(0.)
-
-def init_weights_with_ones(m):
-    m.weight.data.fill_(1.)
-    
+class FeatureExtractor(nn.Module):
+   
+    def __init__(self, mode):
+        super().__init__()
+        
+        if mode == "res50":
+            self.model = Resnet50_FeatureExtrator()
+        
+        if mode == "vgg16":
+            self.model = None # update after
+    def forward(self, x):
+        return sself.model(x)
+       
 class Resnet50_FeatureExtrator(nn.Module):
 
     def __init__(self):
@@ -42,8 +47,7 @@ class CNN(nn.Module):
         self.fc1 = nn.Linear(2048,1024)
         # self.fc2 = nn.Linear(1024,1024)
         self.fc2 = nn.Linear(1024,classes)
-     
-
+                
     def forward(self, x, mode = 'img'):
         
         if  mode == "img":
@@ -57,544 +61,244 @@ class CNN(nn.Module):
             
         resp = self.fc1(feature)
         resp = nn.functional.relu(resp, inplace=False) 
+        resp = nn.functional.dropout(resp, p=0.25, training = self.training, inplace=False)              
         output = self.fc2(resp)
         # resp = nn.functional.relu(resp, inplace=False)         
         # output = self.fc3(resp)
         
         return output
 
-class ScaleKernel(nn.Module):
-  def __init__(self, size_of_kernel):
-    super().__init__()
+class AutoEncoderWithCLF(nn.Module):
 
-    tensor = torch.rand(size_of_kernel)
-    self.weight = parameter.Parameter(tensor, requires_grad=True)      
-
-  def forward(self, x):
-
-    y = x * self.weight 
-
-    return y
-    
-class ShiftKernel(nn.Module):
-  def __init__(self, size_of_kernel):
-    super().__init__()
-
-    tensor = torch.rand(size_of_kernel)
-    self.weight = parameter.Parameter(tensor, requires_grad=True)      
-
-  def forward(self, x):
-
-    y = x + self.weight 
-
-    return y
+    def __init__(self, base_class = 50):
+        super().__init__()
+            
+        self.en1 = nn.Linear(2048,1024)
+        self.en2 = nn.Linear(1024,512)
+        self.en3 = nn.Linear(512,base_class)
+                
+        self.de1 = nn.Linear(base_class,512)
+        self.de2 = nn.Linear(512,1024)
+        self.de3 = nn.Linear(1024,2048)
         
-class Single_Scale_Shift_Kernel(nn.Module):
-  def __init__(self, size_of_kernel, training = True):
-    super().__init__()
+        # self.EncoderModules = nn.Sequential(self.en1, self.en2, self.en3)
+        # self.DecoderModules = nn.Sequential(self.de1, self.de2, self.de3)
+        self.clf = nn.Linear(100, 50)
 
-    self.scale = ScaleKernel(size_of_kernel)
-    self.shift = ShiftKernel(size_of_kernel) 
-    
-    self.scale.apply(init_weights_with_ones)
-    self.shift.apply(init_weights_with_zeros)  
-    
-    for name, value in self.scale.named_parameters():
-    
-                if training == True:
-                    value.requires_grad = True 
-                else:
-                    value.requires_grad = False    
-    
-    for name, value in self.shift.named_parameters():
-    
-                if training == True:
-                    value.requires_grad = True 
-                else:
-                    value.requires_grad = False     
- 
-  def forward(self, x):
+    def forward(self, x):
 
-    y = self.scale(x)
-    y = self.shift(y)
-
-    return y
-    
-class Multi_Scale_Shift_Kernel(nn.Module):
-  def __init__(self, insertion_check_list, sizes_of_kernels, training = True):
-    super().__init__()
-             
-    self.kernel_list = nn.ModuleList([])  
-    
-    # print(insertion_check_list)
-    sizes_of_kernels = iter(sizes_of_kernels)
-    for insert_check in insertion_check_list:
-    
-        if insert_check == True:          
-            size_of_kernel = next(sizes_of_kernels)
-            # print(size_of_kernel)
-            self.kernel_list.append( Single_Scale_Shift_Kernel(size_of_kernel))
-            
-        else:      
-            
-            self.kernel_list.append(None)
-    # print(self.kernel_list)
-             
-
-  # indicate which kernel to be used
-  def forward(self, x, index_of_kernel):
-  
-    if index_of_kernel <0:        
-        raise "error: no kernel mapping of input index!!!"
+        z = self.encode(x)
+        x_head = self.decode(z)                   
+        cls_pred = self.clf(z)
         
-    else:    
-        selected_kernel = self.kernel_list[index_of_kernel]
-        if selected_kernel!= None:
-            #return shift and scale process output for kernel insertion here
-            y = selected_kernel(x)
+        return z, x_head, cls_pred
+    
+    def loss(self, pred, true, origin_classes = 0, mode = 'mse'):
+    
+        if mode == "mse":
+            mse_loss = torch.nn.MSELoss(size_average=None, reduce=None, reduction='mean')
+            loss = mse_loss(pred, true)
+        
+        elif mode == "cross_entropy":
+            en_loss = torch.nn.CrossEntropyLoss(weight=None, reduction='mean')
+            loss = en_loss(pred, true)
             
-        else:
-            #return input for no kernel insertion here
-            y = x
+        elif mode == "bce":
+            # bce_loss = torch.nn.BCELoss()
+            bce_loss = torch.nn.BCEWithLogitsLoss()            
+            loss = bce_loss(pred, true.float())
+            
+        elif mode == "bce_kd":
+            bce_loss = torch.nn.BCEWithLogitsLoss()
+            sigmoid_module = nn.Sigmoid()
+            true = sigmoid_module(true)
+            loss = bce_loss(pred[:,0:origin_classes], true)
+                        
+        return loss
+    
+    def encode(self, x):
+        '''Enocder used oly'''
+        encode1 = self.en1(x)
+        encode1 = nn.functional.dropout(encode1, p=0.25, training = self.training, inplace=False)  
+        encode1 = torch.nn.functional.elu(encode1, alpha=1.0, inplace=False)
+        
+        encode2 = self.en2(encode1)   
+        encode2 = nn.functional.dropout(encode2, p=0.25, training = self.training, inplace=False)          
+        encode2 = torch.nn.functional.elu(encode2, alpha=1.0, inplace=False)
+        
+        encode3 = self.en3(encode2)  # last layer    
 
+        return encode3
 
-    return y
-     
-class SS_Model(nn.Module):
-    def __init__(self, basic_model, insertion_check_list, sizes_of_kernel_set, all_kernel_list = []):
+    def decode(self, x):
+        '''Decoder used oly'''  
+        # x = torch.nn.functional.sigmoid(x)
+        # x = torch.nn.functional.elu(x, alpha=1.0, inplace=False)
+        decode1 = self.de1(x)
+        # decode1 = nn.functional.dropout(decode1, p=0.25, training = self.training, inplace=False)  
+        decode1 = torch.nn.functional.elu(decode1, alpha=1.0, inplace=False)
+        
+        decode2 = self.de2(decode1) 
+        # decode2 = nn.functional.dropout(decode2, p=0.25, training = self.training, inplace=False)  
+        decode2 = torch.nn.functional.elu(decode2, alpha=1.0, inplace=False)
+        
+        decode3 = self.de3(decode2) # last layer    
+
+        return decode3   
+    
+    def classify(self, z):
+    
+        z = torch.nn.functional.elu(z, alpha=1.0, inplace=False)
+        cls_pred = self.clf(z)
+        
+        
+        return cls_pred
+
+class AutoEncoderwithFE(nn.Module):
+    
+    def __init__(self, base_class = 50, feature_size = 2048):
         super().__init__()
         
-        self.basic_model = basic_model
-        self.num_fc_layer = len(list(self.basic_model.children())[1:])
-        self.kernel_set1 = Multi_Scale_Shift_Kernel(insertion_check_list, sizes_of_kernel_set)  
-        self.kernel_set2 = Multi_Scale_Shift_Kernel(insertion_check_list, sizes_of_kernel_set)
-        self.all_kernel_set = nn.ModuleList(all_kernel_list)
-
+        self.FE = Resnet50_FeatureExtrator()
+        self.AE = AutoEncoder(base_class)
+        self.feature_size = feature_size
+        
     def forward(self, x, inp_mode = 'img'):
         
-        if  inp_mode == "img":
-        
-            feature = self.basic_model.FE(x)
-            feature = feature.detach().view(-1,2048) 
+        if inp_mode == 'img':
             
-        elif inp_mode == "f":
-            
-            feature = x.view(-1,2048)
-            
-        output_list=[]
-        # cls1 forward
-        if self.kernel_set1 == None:
-                                                 
-            output1 = self.basic_model(feature, 'f')
-
-        else:
-            resp = feature 
-            for i, module in enumerate(list(self.basic_model.children())[1:]):
-                
-                if i != (self.num_fc_layer-1):
-                    #non-last layer forward
-                    resp = self.kernel_set1(resp, 2*i)
-                    resp = module(resp)
-                    resp = self.kernel_set1(resp, 1 + 2*i)               
-                    resp = nn.functional.relu(resp, inplace=False)
-                else:
-                    #last layer forward
-                    resp = self.kernel_set1(resp, 2*i) 
-                    output1 = module(resp)
-
-         
-        output_list.append(output1)
-        
-        if self.training ==True:
-          
-            resp = feature 
-            for i, module in enumerate(list(self.basic_model.children())[1:]):
-                
-                if i != (self.num_fc_layer-1):
-                    #non-last layer forward
-                    resp = self.kernel_set2(resp, 2*i)
-                    resp = module(resp)
-                    resp = self.kernel_set2(resp, 1 + 2*i)               
-                    resp = nn.functional.dropout(resp, 0.25, inplace=False)
-                    resp = nn.functional.relu(resp, inplace=False)
-                else:
-                    #last layer forward
-                    resp = self.kernel_set2(resp, 2*i) 
-                    output2 = module(resp)
-                    
-            output_list.append(output2)
-        else:
-        
-            # cls2 ~task N forward 
-            for j in range(0,len(self.all_kernel_set)):
-                                           
-                ss_kernels = self.all_kernel_set[j]
-                resp = feature 
-     
-                for i, module in enumerate(list(self.basic_model.children())[1:]):
-                    
-                    if i != (self.num_fc_layer-1):
-                        #non-last layer forward
-                        resp = ss_kernels(resp, 2*i)
-                        resp = module(resp)
-                        resp = ss_kernels(resp, 1 + 2*i)               
-                        resp = nn.functional.relu(resp, inplace=False)
-                    else:
-                        #last layer forward
-                        resp = ss_kernels(resp, 2*i) 
-                        output = module(resp)
-   
-                output_list.append(output)
-            
- 
-        return output_list
-
-class VAE(nn.Module):
-    
-    def __init__(self):
-        super().__init__()
-        
-        self.SharedEncoder = nn.Linear(784,400)
-        self.MeanEncoder = nn.Linear(400,20)
-        self.VarEncoder = nn.Linear(400,20)
-        
-        self.Decoder_Layer1 = nn.Linear(20,400)
-        self.Decoder_Layer2 = nn.Linear(400,784)
-    
-    def reparameter(self, mean, logvar):
-        
-        std = torch.exp(0.5 * logvar)
-        
-        eps = torch.randn_like(std)
-        # torch.normal(mean, std, *, generator=None, out=None) 
-        
-        return mean + std * eps
-    
-    def decode(self, z):
-        
-        resp = self.Decoder_Layer1(z)
-        resp = torch.nn.functional.relu(resp)
-        recover_x = self.Decoder_Layer2(resp)
-        
-        recover_x = torch.nn.functional.sigmoid(recover_x)
-        
-        return recover_x
-    
-    def generate(self, batch_size):
-        
-        z = torch.randn([batch_size, 20]).to("cuda")
-        x = self.decode(z)
-        return x
-        
-    
-    def forward(self, x):
-        
-        x = x.view(-1, 784)
-        resp =  self.SharedEncoder(x)
-        resp = torch.nn.functional.relu(resp)
-        
-        en_mean = self.MeanEncoder(resp)
-        en_var = self.VarEncoder(resp)
-        
-        z = self.reparameter(en_mean, en_var)
-        # z_max, _ = torch.max(z,1)
-        # z_max = z_max.unsqueeze(dim=1)
-        
-        # z_min, _ = torch.min(z, 1)
-        # z_min = z_min.unsqueeze(dim=1)
-        # z = (z - z_min) / (z_min)
-        
-        # resp = self.Decoder_Layer1(z)
-        # resp = torch.nn.functional.leaky_relu(resp)
-        # recover_x = self.Decoder_Layer2(resp)
-        recover_x = self.decode(z)
-        
-        return en_mean, en_var, z, recover_x
-
-class CVAE_x(nn.Module):
-    def __init__(self, feature_size, latent_size, class_size):
-        super(CVAE, self).__init__()
-        self.feature_size = feature_size
-        self.class_size = class_size
-
-        # encode
-        self.fc1  = nn.Linear(feature_size + class_size, 400)
-        self.fc21 = nn.Linear(400, latent_size)
-        self.fc22 = nn.Linear(400, latent_size)
-
-        # decode
-        self.fc3 = nn.Linear(latent_size + class_size, 400)
-        self.fc4 = nn.Linear(400, feature_size)
-
-        self.elu = nn.ELU()
-        self.sigmoid = nn.Sigmoid()
-
-    def encode(self, x, c): # Q(z|x, c)
-        '''
-        x: (bs, feature_size)
-        c: (bs, class_size)
-        '''
-        inputs = torch.cat([x, c], 1) # (bs, feature_size+class_size)
-        h1 = self.elu(self.fc1(inputs))
-        z_mu = self.fc21(h1)
-        z_var = self.fc22(h1)
-        return z_mu, z_var
-
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5*logvar)
-        eps = torch.randn_like(std)
-        return mu + eps*std
-
-    def decode(self, z, c): # P(x|z, c)
-        '''
-        z: (bs, latent_size)
-        c: (bs, class_size)
-        '''
-        inputs = torch.cat([z, c], 1) # (bs, latent_size+class_size)
-        h3 = self.elu(self.fc3(inputs))
-        return self.sigmoid(self.fc4(h3))
-
-    def forward(self, x, c):
-        mu, logvar = self.encode(x.view(-1, 28*28), c)
-        z = self.reparameterize(mu, logvar)
-        return self.decode(z, c), mu, logvar        
-
-class SS_Arch_1():
-    def __init__(self):
-    
-        self.name = "SS forward method"
-        
-    def FcLayerDecomposition(self, FCModel):        
-  
-        
-        fc_module_list = list(FCModel.children())
-        # print(FCModel)
-            
-        num_layers = len(fc_module_list)
-        # activation_list = 
-        if fc_module_list == [] and num_layers == 0 :
-            
-            fc_module_list = [FCModel] 
-            num_layers = 1 
-        
-        Decomp_FC_dict = {"fc_list" :fc_module_list,
-                          # "activ" : activation_list,
-                          "fc_num" : num_layers}
-        
-        return Decomp_FC_dict
-
-    def SSFC_forward(self, input, FCModel, ss_set):
-
-        FC_dict = self.FcLayerDecomposition(FCModel)
-        
-        resp = input
-
-        
-        for i, module in enumerate(FC_dict["fc_list"]):
-                  
-            if i != (FC_dict["fc_num"] - 1):            
-                #non-last layer forward
-              
-                resp = ss_set(resp, 2*i)
-                resp = module(resp)                
-                resp = ss_set(resp, 1 + 2*i) 
-                
-                resp = nn.functional.dropout(resp, p=0.25, training = FCModel.training, inplace=False)                
-                resp = nn.functional.elu(resp, inplace=False) # need post-process while assign base model
-            
-            else:            
-                #last layer forward
-                resp = ss_set(resp, 2*i) 
-                output = module(resp)    
-    
-        return output
-
-    def FullSS_forward(self, input, Base, all_ss_set):
-
-        output_list = []
-        output_list.append(Base(input))        
-        
-        # iterate ss correspond to task
-        for j in range(0, len(all_ss_set)):
-                                       
-            ss_set = all_ss_set[j]
-
-            output = self.SSFC_forward(input, Base, ss_set)
-
-            output_list.append(output)
-        # print(len(output_list))
-        return output_list
-
-    def forward(self, input, Base, ss_set1, ss_set2):  
-
-        if ss_set1 == None:
-            out1 = Base(input)
-        else:
-            out1 = self.SSFC_forward(input, Base, ss_set1)
-            
-        out2 = self.SSFC_forward(input, Base, ss_set2)
-        
-        return out1, out2
-
-class SSAEwithFE(nn.Module):
-    def __init__(self, AEwithFE, insertion_check_list, sizes_of_ss_set, all_ss_list = []):
-        super().__init__()
-        
-        self.Base = AEwithFE
-        self.BaseFE = self.Base.FE
-        self.BaseEncoder = self.Base.AE.Encoder
-        self.BaseDecoder = self.Base.AE.Decoder
-        self.feature_size = 2048
-        
-        self.en_ss_set1 = Multi_Scale_Shift_Kernel(insertion_check_list, sizes_of_ss_set)  
-        self.en_ss_set2 = Multi_Scale_Shift_Kernel(insertion_check_list, sizes_of_ss_set)
-        self.de_ss_set1 = Multi_Scale_Shift_Kernel(insertion_check_list, sizes_of_ss_set)  
-        self.de_ss_set2 = Multi_Scale_Shift_Kernel(insertion_check_list, sizes_of_ss_set)      
-        
-        self.all_ss_set = nn.ModuleList(all_ss_list)         
-                
-        self.arch = SS_Arch_1()
-    
-    def single_encode(self, x, mode = 'img'):
-        
-        if mode == 'img':            
-            feature = self.BaseFE(x)
+            feature = self.FE(x)
             feature = feature.detach().view(-1,self.feature_size )
         
-        elif mode == 'f':
-            feature = x.view(-1,self.feature_size )    
-
-        zcode = self.arch.SSFC_forward(feature, self.BaseEncoder, self.en_ss_set2 )     
-
-        return zcode 
-       
-    def encode(self, x, mode = 'img'):
+        elif inp_mode == 'f':
+            feature = x.view(-1,self.feature_size )
+        
+        
+        encode, decode = self.AE(feature)
+        
+        return encode, decode
+        
+    def encode(self, x,  inp_mode = 'img'):
     
-        if mode == 'img':
+        if inp_mode == 'img':
             
-            feature = self.BaseFE(x)
+            feature = self.FE(x)
             feature = feature.detach().view(-1,self.feature_size )
         
-        elif mode == 'f':
+        elif inp_mode == 'f':
             feature = x.view(-1,self.feature_size )    
-
-        zcodes = self.arch.forward(feature, self.BaseEncoder, self.en_ss_set1, self.en_ss_set2)     
-
-        return zcodes
+        
+        zcode = self.AE.encode(feature)
+        
+        return zcode
         
     def decode(self, x):   
+        
+        return self.AE.decode(x)      
+
+class Encoder(nn.Module):
+    def __init__(self, base_class):
+        super().__init__()  
+        
+        self.en1 = nn.Linear(2048,1024)
+        self.en2 = nn.Linear(1024,512)
+        self.en3 = nn.Linear(512,base_class)
     
-        xhead = self.arch.SSFC_forward(x, self.BaseDecoder, self.de_ss_set2)
-                
-        return xhead        
+    def forward(self, x):
+        encode1 = self.en1(x)
+        encode1 = nn.functional.dropout(encode1, p=0.25, training = self.training, inplace=False)  
+        encode1 = torch.nn.functional.elu(encode1, alpha=1.0, inplace=False)
         
-    def forward(self, x, mode = 'img', out_mode = 'both'):
+        encode2 = self.en2(encode1)   
+        encode2 = nn.functional.dropout(encode2, p=0.25, training = self.training, inplace=False)          
+        encode2 = torch.nn.functional.elu(encode2, alpha=1.0, inplace=False)        
+        encode3 = self.en3(encode2)
         
-        if mode == 'img':
-            
-            feature = self.BaseFE(x)
-            feature = feature.detach().view(-1,self.feature_size)
-        
-        elif mode == 'f':
-            feature = x.view(-1,self.feature_size)
-        
-        if self.training:
-        
-            encode_vectors = self.encode(x)
-            decode_vector = self.decode(encode_vectors[-1])
-            
-            return encode_vectors, decode_vector 
-            
-        else:
-        
-            if out_mode == 'both':
-                
-                # hireachy testing
-                encode_vectors = self.arch.FullSS_forward(feature, self.BaseEncoder, self.all_ss_set)
-                decode_vector = self.decode(encode_vectors[-1])        
-            
-                return encode_vectors, decode_vector    
+        return encode3
 
-            elif out_mode == 'encode':
-               
-                # hireachy testing
-                encode_vectors = self.arch.FullSS_forward(feature, self.BaseEncoder, self.all_ss_set)        
-                return encode_vectors
-           
-            elif out_mode == 'decode':
-                decode_vector = self.decode(encode_vectors[-1])        
-                return decode_vector               
-
-class Block_MultiSS(nn.Module):
+class Decoder(nn.Module):
+    def __init__(self, base_class):
+        super().__init__()  
+        
+        self.de1 = nn.Linear(base_class,512)
+        self.de2 = nn.Linear(512,1024)
+        self.de3 = nn.Linear(1024,2048)
     
-    def __init__(self, model_block_names, inser_check_dict, ss_size_dict):
-        super(Block_MultiSS, self).__init__()
-        
-        self.SSDict = nn.ModuleDict()
-        
-        for name in model_block_names:
+    def forward(self, x):
+        '''Decoder used oly'''  
 
-            self.SSDict.update({name : Multi_Scale_Shift_Kernel(inser_check_dict[name], ss_size_dict[name])})
-    
-    def forward(self, name, ss_index, x):
+        decode1 = self.de1(x)
+        decode1 = torch.nn.functional.elu(decode1, alpha=1.0, inplace=False)
         
-        return self.SSDict[name](ss_index, x)
+        decode2 = self.de2(decode1) 
+        decode2 = torch.nn.functional.elu(decode2, alpha=1.0, inplace=False)
+        
+        decode3 = self.de3(decode2) # last layer    
+        
+        return decode3    
 
-class SSCVAE(nn.Module):
-    def __init__(self, cvae, insert_check_dict, sizes_dict):
+class AutoEncoder(nn.Module):
+
+    def __init__(self, base_class = 50):
         super().__init__()
-        
-        self.Base = cvae
-        # self.BaseFE = self.Base.FE
-        self.BaseEncoder = self.Base.encoder
-        self.BaseDecoder = self.Base.decoder
-        
-        self.feature_size = 784
-        
-        encodr_block_names = ["share", "mean", "var"]
-        self.EncoderSS1 = Block_MultiSS(encodr_block_names, insert_check_dict["en"], sizes_dict["en"])  
-        # self.EncoderSS2 = Block_MultiSS(encodr_block_names, insert_check_dict["en"], sizes_dict["en"])  
-
-        decodr_block_names = ["de"]
-        self.DecoderSS1 = Block_MultiSS(decodr_block_names, insert_check_dict, sizes_dict)  
-        # self.DecoderSS2 = Block_MultiSS(decodr_block_names, insert_check_dict["de"], sizes_dict["de"])  
-        
-        # self.All_SS_Set = nn.ModuleList(all_ss_list)         
                 
-        self.arch = SS_Arch_1()    
+        self.Encoder = Encoder(base_class)
+        self.Decoder = Decoder(base_class)
+        
+    def forward(self, x):
 
-    def encode(self, x, c):
+        z = self.encode(x)
+        x_head = self.decode(z)                   
         
-        input = torch.cat([x, c], 1)
-        
-        resp = self.arch.SSFC_forward( input, self.BaseEncoder.ShareFC, self.EncoderSS1.SSDict["share"])                
-        resp = nn.functional.dropout(resp, p=0.25, training = self.training, inplace=False)                
-        resp = nn.functional.elu(resp, inplace=False) # need post-process while assign base model        
-        
-        z_mu = self.arch.SSFC_forward( resp, self.BaseEncoder.MeanEncoder, self.EncoderSS1.SSDict["mean"])
-        z_var = self.arch.SSFC_forward( resp, self.BaseEncoder.MeanEncoder, self.EncoderSS1.SSDict["var"])
-        
-        return z_mu, z_var    
-    
-    def decode(self, x, c):
-        
-        input = torch.cat([x, c], 1)
-        xhead = self.arch.SSFC_forward( input, self.BaseDecoder, self.DecoderSS1.SSDict["de"])
-        
-        return self.Base.sigmoid(xhead)
-    
-    def reparameterize(self, mu, logvar):
-    
-        std = torch.exp(0.5*logvar)
-        eps = torch.randn_like(std)
-        
-        return mu + eps*std
-        
-    def forward(self, x, c):
-        mu, logvar = self.encode(x.view(-1, 28*28), c)
-        z = self.reparameterize(mu, logvar)
-        return self.decode(z, c), mu, logvar   
+        return z, x_head
 
+    def encode(self, x): 
+        
+        z = self.Encoder(x)   
+
+        return z
+
+    def decode(self, x):
+        
+        x_h = self.Decoder(x)
+
+        return x_h   
+        
+    def loss(self, pred, true, origin_classes = 0, mode = 'mse'):
+    
+        if mode == "mse":
+            mse_loss = torch.nn.MSELoss(size_average=None, reduce=None, reduction='mean')
+            loss = mse_loss(pred, true)
+        
+        elif mode == "cross_entropy":
+            en_loss = torch.nn.CrossEntropyLoss(weight=None, reduction='mean')
+            loss = en_loss(pred, true)
+            
+        elif mode == "bce":
+            # bce_loss = torch.nn.BCELoss()
+            bce_loss = torch.nn.BCEWithLogitsLoss()            
+            loss = bce_loss(pred, true.float())
+            
+        elif mode == "bce_kd":
+            bce_loss = torch.nn.BCEWithLogitsLoss()
+            sigmoid_module = nn.Sigmoid()
+            true = sigmoid_module(true)
+    
+            loss = bce_loss(pred[:,0:origin_classes], true[:,0:origin_classes])
+                        
+        return loss
+    
+
+        '''Decoder used oly'''    
+        decode1 = self.de1(x)
+        decode1 = torch.nn.functional.elu(decode1, alpha=1.0, inplace=False)
+        
+        decode2 = self.de2(decode1) 
+        decode2 = torch.nn.functional.elu(decode2, alpha=1.0, inplace=False)
+        
+        decode3 = self.de3(decode2) # last layer    
+
+        return decode3                       
 class CVAE(nn.Module):
     def __init__(self, feature_size, latent_size, class_size):
         super(CVAE, self).__init__()
@@ -682,5 +386,6 @@ class CVAEDecoder(nn.Module):
         return decode2    
 
 
-if __name__ == "__main__":
-    print(__name__)
+if __name__ == "__main__" :
+   
+   print(__name__)
